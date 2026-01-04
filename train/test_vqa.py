@@ -323,10 +323,10 @@ for event in prof.key_averages():
     elif "pool" in key.lower():
         category = "Pooling"
 
-    layer_stats[category]["cpu_time"] += event.cpu_time_total
-    layer_stats[category]["cuda_time"] += event.cuda_time_total
+    layer_stats[category]["cpu_time"] += event.self_cpu_time_total
+    layer_stats[category]["cuda_time"] += event.self_cuda_time_total if hasattr(event, 'self_cuda_time_total') else 0
     layer_stats[category]["count"] += event.count
-    layer_stats[category]["memory"] += event.cuda_memory_usage
+    layer_stats[category]["memory"] += event.self_cuda_memory_usage if hasattr(event, 'self_cuda_memory_usage') else 0
 
 # Sort by CUDA time
 sorted_stats = sorted(layer_stats.items(), key=lambda x: x[1]["cuda_time"], reverse=True)
@@ -402,8 +402,8 @@ print("-" * 60)
 for event in prof.key_averages():
     if event.key.startswith(("1_", "2_", "3_")):
         stage_name = event.key.split("_", 1)[1] if "_" in event.key else event.key
-        cpu_time_ms = event.cpu_time_total / 1000
-        cuda_time_ms = event.cuda_time_total / 1000
+        cpu_time_ms = event.self_cpu_time_total / 1000
+        cuda_time_ms = event.self_cuda_time_total / 1000 if hasattr(event, 'self_cuda_time_total') else 0
         print(f"{stage_name:<25} {cpu_time_ms:>12.2f}ms {cuda_time_ms:>12.2f}ms")
 
 # ============================================================

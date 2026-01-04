@@ -5,6 +5,7 @@ Loads base model + LoRA adapter and evaluates on VQAv2
 """
 
 import torch
+from torch.profiler import profile, ProfilerActivity, record_function
 from transformers import AutoProcessor, AutoModelForImageTextToText
 from peft import PeftModel
 from datasets import load_dataset
@@ -12,6 +13,7 @@ from tqdm import tqdm
 import json
 import time
 import statistics
+from collections import defaultdict
 import sys
 
 print("=" * 80)
@@ -28,6 +30,8 @@ else:
 
 BASE_MODEL = "HuggingFaceTB/SmolVLM2-256M-Instruct"
 NUM_TEST_SAMPLES = 100
+MAX_NEW_TOKENS = 50
+PROFILE_SAMPLES = 10  # Number of samples to profile in detail
 
 print(f"🎯 Base model: {BASE_MODEL}")
 print(f"🎯 Adapter path: {ADAPTER_PATH}")
@@ -52,6 +56,11 @@ processor = AutoProcessor.from_pretrained(ADAPTER_PATH)
 
 print(f"✅ Model loaded on: {next(model.parameters()).device}")
 print(f"📏 Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+
+# Print model architecture summary
+print("\n🏗️  Model Architecture:")
+for name, module in model.named_children():
+    print(f"  • {name}: {module.__class__.__name__}")
 
 # ============================================================
 # Load Test Dataset
@@ -118,10 +127,10 @@ torch.cuda.synchronize()
 print("✅ GPU warmed up")
 
 # ============================================================
-# Run Inference Tests
+# Part 1: Standard Inference Testing
 # ============================================================
 print("\n" + "=" * 80)
-print("RUNNING INFERENCE TESTS")
+print("PART 1: STANDARD INFERENCE TESTING")
 print("=" * 80)
 
 results = []
@@ -164,6 +173,7 @@ for i in tqdm(range(min(NUM_TEST_SAMPLES, len(test_ds)))):
         "question": question,
         "ground_truth": ground_truth,
         "prediction": answer,
+        "raw_output": generated_text,  # Store raw output for debugging
         "correct": is_correct
     })
 
@@ -183,9 +193,9 @@ print(f"Total time: {total_time:.2f}s")
 print(f"Average time per sample: {total_time/total*1000:.2f}ms")
 print(f"Throughput: {total/total_time:.2f} samples/sec")
 
-# Show examples
+# Show some examples
 print("\n📝 Sample Predictions:")
-for i in range(min(10, len(results))):
+for i in range(min(5, len(results))):
     r = results[i]
     status = "✅" if r["correct"] else "❌"
     print(f"\n{status} Question: {r['question']}")
@@ -195,13 +205,179 @@ for i in range(min(10, len(results))):
 # Save results
 results_file = "test_vqa_qlora_results.json"
 with open(results_file, 'w') as f:
-    json.dump({
-        "accuracy": correct/total*100,
-        "total_samples": total,
-        "correct": correct,
-        "results": results
-    }, f, indent=2)
-print(f"\n💾 Results saved to: {results_file}")
+    json.dump(results, f, indent=2)
+print(f"\n💾 Full results saved to: {results_file}")
+
+# ============================================================
+# Part 2: Detailed Layer-Level Profiling
+# ============================================================
+print("\n" + "=" * 80)
+print("PART 2: DETAILED LAYER-LEVEL PROFILING")
+print("=" * 80)
+
+print(f"\n🔍 Profiling {PROFILE_SAMPLES} inference runs...")
+
+# Profile with detailed layer information
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=True,
+    with_flops=True,
+) as prof:
+    with torch.no_grad():
+        for i in range(PROFILE_SAMPLES):
+            example = test_ds[i]
+            inputs, _, _ = prepare_input(example)
+            _ = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS)
+
+# ============================================================
+# Analyze Profiling Results by Layer Type
+# ============================================================
+print("\n" + "=" * 80)
+print("TOP OPERATIONS BY CUDA TIME")
+print("=" * 80)
+print(prof.key_averages().table(
+    sort_by="cuda_time_total",
+    row_limit=20
+))
+
+print("\n" + "=" * 80)
+print("TOP OPERATIONS BY CPU TIME")
+print("=" * 80)
+print(prof.key_averages().table(
+    sort_by="cpu_time_total",
+    row_limit=20
+))
+
+print("\n" + "=" * 80)
+print("TOP OPERATIONS BY MEMORY USAGE")
+print("=" * 80)
+print(prof.key_averages().table(
+    sort_by="cuda_memory_usage",
+    row_limit=20
+))
+
+# ============================================================
+# Aggregate by Layer Type
+# ============================================================
+print("\n" + "=" * 80)
+print("BREAKDOWN BY LAYER/OPERATION TYPE")
+print("=" * 80)
+
+layer_stats = defaultdict(lambda: {"cpu_time": 0, "cuda_time": 0, "count": 0, "memory": 0})
+
+for event in prof.key_averages():
+    key = event.key
+
+    # Categorize operations
+    category = "Other"
+
+    if "layernorm" in key.lower() or "layer_norm" in key.lower():
+        category = "LayerNorm"
+    elif "linear" in key.lower() or "addmm" in key.lower() or "matmul" in key.lower() or "gemm" in key.lower():
+        category = "Linear/MatMul"
+    elif "attention" in key.lower() or "softmax" in key.lower():
+        category = "Attention"
+    elif "gelu" in key.lower() or "silu" in key.lower() or "relu" in key.lower():
+        category = "Activation"
+    elif "conv" in key.lower():
+        category = "Convolution"
+    elif "embedding" in key.lower() or "embed" in key.lower():
+        category = "Embedding"
+    elif "dropout" in key.lower():
+        category = "Dropout"
+    elif "batch_norm" in key.lower() or "batchnorm" in key.lower():
+        category = "BatchNorm"
+    elif "vision" in key.lower() or "image" in key.lower():
+        category = "Vision Encoder"
+    elif "pool" in key.lower():
+        category = "Pooling"
+    elif "lora" in key.lower() or "adapter" in key.lower():
+        category = "LoRA Adapter"
+
+    layer_stats[category]["cpu_time"] += event.self_cpu_time_total
+    layer_stats[category]["cuda_time"] += event.self_cuda_time_total if hasattr(event, 'self_cuda_time_total') else 0
+    layer_stats[category]["count"] += event.count
+    layer_stats[category]["memory"] += event.self_cuda_memory_usage if hasattr(event, 'self_cuda_memory_usage') else 0
+
+# Sort by CUDA time
+sorted_stats = sorted(layer_stats.items(), key=lambda x: x[1]["cuda_time"], reverse=True)
+
+print(f"\n{'Category':<20} {'CUDA Time':<15} {'CPU Time':<15} {'Memory':<15} {'Count':<10} {'%Time':<10}")
+print("-" * 100)
+
+total_cuda_time = sum(stats["cuda_time"] for _, stats in sorted_stats)
+
+for category, stats in sorted_stats:
+    cuda_time_ms = stats["cuda_time"] / 1000  # Convert to ms
+    cpu_time_ms = stats["cpu_time"] / 1000
+    memory_mb = stats["memory"] / (1024 * 1024)  # Convert to MB
+    percentage = (stats["cuda_time"] / total_cuda_time * 100) if total_cuda_time > 0 else 0
+
+    print(f"{category:<20} {cuda_time_ms:>12.2f}ms {cpu_time_ms:>12.2f}ms {memory_mb:>12.2f}MB {stats['count']:>8} {percentage:>8.1f}%")
+
+# ============================================================
+# Export Traces for Visualization
+# ============================================================
+print("\n" + "=" * 80)
+print("EXPORTING TRACE FILES")
+print("=" * 80)
+
+# Chrome trace
+chrome_trace_file = "test_vqa_qlora_trace.json"
+prof.export_chrome_trace(chrome_trace_file)
+print(f"✅ Chrome trace saved to: {chrome_trace_file}")
+print(f"   View at: chrome://tracing")
+
+# ============================================================
+# Additional Profiling with Custom Contexts
+# ============================================================
+print("\n" + "=" * 80)
+print("DETAILED INFERENCE PIPELINE BREAKDOWN")
+print("=" * 80)
+
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    record_shapes=True,
+) as prof:
+    with torch.no_grad():
+        example = test_ds[0]
+        image = example["image"]
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        question = example["question"]
+
+        with record_function("1_preprocessing"):
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Answer briefly."},
+                        {"type": "image"},
+                        {"type": "text", "text": question}
+                    ]
+                }
+            ]
+            text = processor.apply_chat_template(messages, add_generation_prompt=True)
+            inputs = processor(text=text, images=[image], return_tensors="pt")
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+        with record_function("2_model_generation"):
+            generated_ids = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS)
+
+        with record_function("3_postprocessing"):
+            generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)
+
+print(f"\n{'Stage':<25} {'CPU Time':<15} {'CUDA Time':<15}")
+print("-" * 60)
+
+for event in prof.key_averages():
+    if event.key.startswith(("1_", "2_", "3_")):
+        stage_name = event.key.split("_", 1)[1] if "_" in event.key else event.key
+        cpu_time_ms = event.self_cpu_time_total / 1000
+        cuda_time_ms = event.self_cuda_time_total / 1000 if hasattr(event, 'self_cuda_time_total') else 0
+        print(f"{stage_name:<25} {cpu_time_ms:>12.2f}ms {cuda_time_ms:>12.2f}ms")
 
 # ============================================================
 # Latency Benchmark
@@ -211,41 +387,78 @@ print("LATENCY BENCHMARK")
 print("=" * 80)
 
 torch.cuda.synchronize()
+start_event = torch.cuda.Event(enable_timing=True)
+end_event = torch.cuda.Event(enable_timing=True)
+
 num_runs = 50
 times = []
 
-print(f"\n⏱️  Running {num_runs} inference passes...")
+print(f"\n⏱️  Running {num_runs} inference passes for timing statistics...")
 
 for i in range(num_runs):
     example = test_ds[i % len(test_ds)]
     inputs, _, _ = prepare_input(example)
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
     start_event.record()
     with torch.no_grad():
-        _ = model.generate(**inputs, max_new_tokens=50)
+        _ = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS)
     end_event.record()
     torch.cuda.synchronize()
     times.append(start_event.elapsed_time(end_event))
 
 print(f"\n{'Metric':<20} {'Value':<15}")
 print("-" * 40)
+print(f"{'Runs':<20} {num_runs:<15}")
 print(f"{'Mean':<20} {statistics.mean(times):>12.2f}ms")
 print(f"{'Median':<20} {statistics.median(times):>12.2f}ms")
 print(f"{'Min':<20} {min(times):>12.2f}ms")
 print(f"{'Max':<20} {max(times):>12.2f}ms")
 print(f"{'Std Dev':<20} {statistics.stdev(times):>12.2f}ms")
+print(f"{'P95':<20} {sorted(times)[int(0.95*len(times))]:>12.2f}ms")
+print(f"{'P99':<20} {sorted(times)[int(0.99*len(times))]:>12.2f}ms")
+
+# Save timing stats
+timing_file = "test_vqa_qlora_timing.json"
+with open(timing_file, 'w') as f:
+    json.dump({
+        "num_runs": num_runs,
+        "times_ms": times,
+        "mean_ms": statistics.mean(times),
+        "median_ms": statistics.median(times),
+        "min_ms": min(times),
+        "max_ms": max(times),
+        "std_ms": statistics.stdev(times),
+        "p95_ms": sorted(times)[int(0.95*len(times))],
+        "p99_ms": sorted(times)[int(0.99*len(times))],
+    }, f, indent=2)
+print(f"\n💾 Timing statistics saved to: {timing_file}")
+
+# ============================================================
+# GPU Memory Analysis
+# ============================================================
+print("\n" + "=" * 80)
+print("GPU MEMORY ANALYSIS")
+print("=" * 80)
+
+if torch.cuda.is_available():
+    print(f"\n{'Metric':<30} {'Value':<20}")
+    print("-" * 55)
+    print(f"{'Allocated Memory':<30} {torch.cuda.memory_allocated() / 1024**3:>17.2f} GB")
+    print(f"{'Reserved Memory':<30} {torch.cuda.memory_reserved() / 1024**3:>17.2f} GB")
+    print(f"{'Max Allocated Memory':<30} {torch.cuda.max_memory_allocated() / 1024**3:>17.2f} GB")
+    print(f"{'Max Reserved Memory':<30} {torch.cuda.max_memory_reserved() / 1024**3:>17.2f} GB")
 
 # ============================================================
 # Summary
 # ============================================================
 print("\n" + "=" * 80)
-print("✅ TESTING COMPLETE!")
+print("✅ TESTING & PROFILING COMPLETE!")
 print("=" * 80)
 print(f"\n📊 Accuracy: {correct/total*100:.2f}%")
 print(f"⚡ Average Latency: {statistics.mean(times):.2f}ms")
 print(f"🎯 Throughput: {1000/statistics.mean(times):.2f} samples/sec")
-print(f"\n📁 Results saved to: {results_file}")
+print(f"\n📁 Generated Files:")
+print(f"   • {results_file} - Full test results")
+print(f"   • {chrome_trace_file} - Chrome trace (view at chrome://tracing)")
+print(f"   • {timing_file} - Latency statistics")
 print("\n" + "=" * 80)
